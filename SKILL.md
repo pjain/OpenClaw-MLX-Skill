@@ -448,3 +448,384 @@ User request
     │
     └─ New/unknown MLX model    →  Check mlx-community on HF, follow Extensibility guide
 ```
+
+---
+
+## Distributed Inference — LAN Cluster
+
+MLX supports distributed inference across multiple Macs on a LAN using `mlx.launch`.
+Model layers are sharded (tensor parallelism) across all nodes, letting you pool RAM across
+machines to run models far larger than any single Mac could handle.
+
+> **Combined RAM example**: 4× Mac Mini M4 with 24 GB each = 96 GB effective RAM,
+> enough to run a 70B model at 4-bit quantization comfortably.
+
+### How It Works
+
+MLX distributes using **tensor parallelism** — each node holds a shard of the model's
+weight matrices. On every forward pass, all nodes communicate intermediate results via
+collective operations (`all_reduce`, `all_sum`). The ring backend does this over TCP/IP,
+making it work on any LAN including Wi-Fi (though gigabit Ethernet or better is strongly
+preferred for throughput).
+
+### Backend Selection
+
+| Backend | Transport | Requirements | Latency | Best For |
+|---------|-----------|-------------|---------|----------|
+| `ring` | Ethernet/Wi-Fi TCP | SSH + same Python path | Medium | **LAN clusters — use this** |
+| `jaccl` | Thunderbolt 5 RDMA | macOS 26.2+, TB5 cables, recovery mode setup | Ultra-low | Directly connected Macs |
+| `mpi` | TCP via OpenMPI | OpenMPI installed | Medium | Legacy setups |
+
+For a general LAN (the common case), **always use the ring backend**.
+
+---
+
+### Prerequisites Checklist
+
+Run this on the **controller node** to verify readiness before attempting distributed launch:
+
+```python
+import subprocess, json, os, sys
+
+def check_node(host, python_path=None):
+    """SSH to a node and verify it's ready for MLX distributed inference."""
+    results = {}
+
+    # SSH reachable?
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                        host, "echo ok"], capture_output=True, text=True)
+    results["ssh_ok"] = r.returncode == 0
+
+    if not results["ssh_ok"]:
+        results["error"] = r.stderr.strip()
+        return results
+
+    # Apple Silicon?
+    r = subprocess.run(["ssh", host, "uname -m"], capture_output=True, text=True)
+    results["apple_silicon"] = r.stdout.strip() == "arm64"
+
+    # Python path
+    py = python_path or "python3"
+    r = subprocess.run(["ssh", host, f"{py} -c 'import mlx; print(mlx.__version__)'"],
+                       capture_output=True, text=True)
+    results["mlx_installed"] = r.returncode == 0
+    results["mlx_version"] = r.stdout.strip() if r.returncode == 0 else None
+
+    # mlx-lm installed?
+    r = subprocess.run(["ssh", host, f"{py} -c 'import mlx_lm; print(mlx_lm.__version__)'"],
+                       capture_output=True, text=True)
+    results["mlx_lm_installed"] = r.returncode == 0
+
+    # RAM
+    r = subprocess.run(["ssh", host, "sysctl -n hw.memsize"], capture_output=True, text=True)
+    if r.returncode == 0:
+        results["ram_gb"] = round(int(r.stdout.strip()) / 1e9, 1)
+
+    # IP on LAN
+    r = subprocess.run(["ssh", host, "ipconfig getifaddr en0"], capture_output=True, text=True)
+    results["lan_ip"] = r.stdout.strip() or None
+
+    return results
+
+# --- Configure these ---
+HOSTS = ["mac-mini-1.local", "mac-mini-2.local", "mac-mini-3.local"]
+PYTHON_PATH = "/usr/local/bin/python3"   # must be identical on all nodes
+# ----------------------
+
+print("Checking cluster readiness...\n")
+total_ram = 0
+all_ready = True
+for host in HOSTS:
+    r = check_node(host, PYTHON_PATH)
+    ok = r.get("ssh_ok") and r.get("mlx_installed") and r.get("mlx_lm_installed")
+    ram = r.get("ram_gb", 0)
+    total_ram += ram
+    status = "✅" if ok else "❌"
+    print(f"{status} {host}: SSH={r.get('ssh_ok')} MLX={r.get('mlx_installed')} "
+          f"mlx-lm={r.get('mlx_lm_installed')} RAM={ram}GB IP={r.get('lan_ip')}")
+    if not ok:
+        all_ready = False
+        if r.get("error"):
+            print(f"   Error: {r['error']}")
+
+print(f"\nTotal pooled RAM: {total_ram} GB")
+print(f"Cluster ready: {'YES' % all_ready if all_ready else 'NO — fix issues above first'}")
+```
+
+Fix any failures before proceeding:
+- **SSH not ok**: Enable Remote Login on that Mac (`System Settings → General → Sharing → Remote Login`), then set up passwordless SSH keys
+- **MLX not installed**: SSH in and `pip install mlx mlx-lm`
+- **Python path mismatch**: All nodes must use the exact same Python binary path
+
+---
+
+### Step D1 — Set Up Passwordless SSH
+
+Each node needs to be able to SSH to every other node without a password prompt.
+Run this once from the controller, replacing hostnames:
+
+```bash
+# Generate SSH key if you don't have one
+ssh-keygen -t ed25519 -C "mlx-cluster" -f ~/.ssh/id_mlx -N ""
+
+# Copy key to each node
+for HOST in mac-mini-1.local mac-mini-2.local mac-mini-3.local; do
+    ssh-copy-id -i ~/.ssh/id_mlx.pub "$HOST"
+done
+
+# Verify (should not prompt for password)
+for HOST in mac-mini-1.local mac-mini-2.local mac-mini-3.local; do
+    ssh -i ~/.ssh/id_mlx "$HOST" "echo '$HOST: SSH OK'"
+done
+```
+
+---
+
+### Step D2 — Discover LAN Nodes Automatically
+
+Don't hardcode IPs — scan the LAN for Macs with MLX installed:
+
+```python
+import subprocess, ipaddress, concurrent.futures, socket
+
+def get_local_subnet():
+    """Get the local /24 subnet to scan."""
+    result = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True)
+    ip = result.stdout.strip()
+    if not ip:
+        result = subprocess.run(["ipconfig", "getifaddr", "en1"], capture_output=True, text=True)
+        ip = result.stdout.strip()
+    if not ip:
+        raise RuntimeError("Could not determine local IP address")
+    # Return the /24 network
+    parts = ip.rsplit(".", 1)
+    return f"{parts[0]}.0/24", ip
+
+def probe_host(ip, python_path="python3", timeout=2):
+    """Check if a host has MLX installed and return its info."""
+    try:
+        # Try SSH
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=no", str(ip),
+             f"{python_path} -c \"import mlx, mlx_lm, platform, json; "
+             f"mem=int(__import__('subprocess').check_output(['sysctl','-n','hw.memsize']).decode()); "
+             f"print(json.dumps({{'ip': str('{ip}'), 'ram_gb': round(mem/1e9,1), "
+             f"'mlx': mlx.__version__, 'hostname': platform.node()}}))\""],
+            capture_output=True, text=True, timeout=timeout + 1
+        )
+        if r.returncode == 0:
+            import json
+            return json.loads(r.stdout.strip())
+    except:
+        pass
+    return None
+
+def discover_mlx_nodes(python_path="python3", max_workers=50):
+    """Scan the local subnet for Macs with MLX installed."""
+    subnet, local_ip = get_local_subnet()
+    print(f"Scanning {subnet} for MLX nodes (local IP: {local_ip})...")
+    network = ipaddress.IPv4Network(subnet, strict=False)
+    hosts = [str(ip) for ip in network.hosts()]
+
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(probe_host, ip, python_path): ip for ip in hosts}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                found.append(result)
+                print(f"  Found: {result['hostname']} ({result['ip']}) — "
+                      f"{result['ram_gb']} GB RAM, MLX {result['mlx']}")
+
+    found.sort(key=lambda x: x["ram_gb"], reverse=True)
+    total_ram = sum(n["ram_gb"] for n in found)
+    print(f"\nFound {len(found)} MLX nodes, {total_ram} GB pooled RAM")
+    return found
+
+# Run discovery
+PYTHON_PATH = "/usr/local/bin/python3"  # adjust to match your nodes
+nodes = discover_mlx_nodes(python_path=PYTHON_PATH)
+```
+
+---
+
+### Step D3 — Generate Hostfile
+
+`mlx.launch` needs a JSON hostfile describing each node. Generate it from discovered nodes:
+
+```python
+import json, subprocess
+
+def generate_hostfile(nodes, python_path, output_path="~/.mlx-cluster.json"):
+    """Generate an mlx.launch-compatible hostfile from discovered nodes."""
+    import os
+    output_path = os.path.expanduser(output_path)
+
+    hostfile = []
+    for i, node in enumerate(nodes):
+        hostfile.append({
+            "ssh": node["ip"],
+            "ips": [node["ip"]],
+            "python": python_path,
+        })
+
+    with open(output_path, "w") as f:
+        json.dump(hostfile, f, indent=2)
+
+    print(f"Hostfile written to: {output_path}")
+    print(f"Contents:\n{json.dumps(hostfile, indent=2)}")
+    return output_path
+
+# OR: use MLX's built-in tool for Ethernet setup
+# mlx.distributed_config --backend ring --over ethernet --hosts host1,host2,host3
+
+# Generate from discovered nodes
+PYTHON_PATH = "/usr/local/bin/python3"
+hostfile_path = generate_hostfile(nodes, python_path=PYTHON_PATH)
+```
+
+**Or use the built-in MLX config tool** (simpler if all nodes use hostnames):
+```bash
+# Auto-generate hostfile for ring over Ethernet
+mlx.distributed_config \
+  --backend ring \
+  --over ethernet \
+  --hosts mac-mini-1.local,mac-mini-2.local,mac-mini-3.local \
+  --output ~/.mlx-cluster.json
+```
+
+---
+
+### Step D4 — Launch Distributed Inference
+
+#### LLM Inference (mlx-lm, the primary distributed use case)
+
+```bash
+# Basic distributed chat
+mlx.launch \
+  --verbose \
+  --backend ring \
+  --hostfile ~/.mlx-cluster.json \
+  -- \
+  /usr/local/bin/python3 -m mlx_lm.generate \
+    --model mlx-community/Llama-3.1-70B-Instruct-4bit \
+    --prompt "Explain the theory of relativity" \
+    --max-tokens 500
+
+# Interactive distributed chat REPL
+mlx.launch \
+  --backend ring \
+  --hostfile ~/.mlx-cluster.json \
+  -- \
+  /usr/local/bin/python3 -m mlx_lm chat \
+    --model mlx-community/DeepSeek-R1-0528-4bit
+```
+
+**With the performance env var** (recommended for LAN):
+```bash
+mlx.launch \
+  --verbose \
+  --backend ring \
+  --hostfile ~/.mlx-cluster.json \
+  --env MLX_METAL_FAST_SYNCH=1 \
+  -- \
+  /usr/local/bin/python3 -m mlx_lm chat \
+    --model mlx-community/Llama-3.1-70B-Instruct-4bit
+```
+
+#### Python API for distributed inference
+
+```python
+# This script must be launched via mlx.launch, not run directly
+import mlx.core as mx
+from mlx_lm import load, generate
+
+# Initialize distributed group — automatically picks up rank/hostfile from env
+world = mx.distributed.init()
+rank = world.rank()
+size = world.size()
+
+if rank == 0:
+    print(f"Running distributed inference across {size} nodes")
+
+# Load model — mlx-lm handles sharding automatically when distributed
+model, tokenizer = load("mlx-community/Llama-3.1-70B-Instruct-4bit")
+
+# Only rank 0 needs to handle output
+if rank == 0:
+    response = generate(model, tokenizer, prompt="Hello!", max_tokens=200, verbose=True)
+    print(response)
+else:
+    generate(model, tokenizer, prompt="Hello!", max_tokens=200, verbose=False)
+```
+
+Save as `distributed_infer.py` (same path on all nodes), then launch:
+```bash
+mlx.launch --backend ring --hostfile ~/.mlx-cluster.json \
+  -- /usr/local/bin/python3 /path/to/distributed_infer.py
+```
+
+---
+
+### Step D5 — Model Size vs Node Count Guide
+
+Use pooled RAM to determine which models become accessible:
+
+```
+2 nodes × 16 GB =  32 GB → Llama-3.1-8B (full), Qwen2.5-14B-4bit
+2 nodes × 24 GB =  48 GB → Llama-3.1-70B-4bit (tight), Mixtral-8x7B
+2 nodes × 32 GB =  64 GB → Llama-3.1-70B-4bit (comfortable)
+4 nodes × 16 GB =  64 GB → Llama-3.1-70B-4bit, DeepSeek-V3-4bit
+4 nodes × 24 GB =  96 GB → DeepSeek-R1-4bit, Llama-3.1-70B full precision
+4 nodes × 32 GB = 128 GB → Any current open-source model at full precision
+8 nodes × 16 GB = 128 GB → Same as above
+```
+
+**Recommended distributed models** (tensor-parallel friendly):
+- `mlx-community/Llama-3.1-70B-Instruct-4bit` — 40 GB, needs 2× 24 GB or 3× 16 GB
+- `mlx-community/DeepSeek-R1-0528-4bit` — excellent reasoning, very large
+- `mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit` — MoE, distributes efficiently
+- `mlx-community/Qwen2.5-72B-Instruct-4bit` — great multilingual performance
+
+---
+
+### Distributed Error Handling
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `ssh: connect to host X port 22: Connection refused` | Remote Login not enabled | System Settings → Sharing → Remote Login → On |
+| `Permission denied (publickey)` | SSH key not on remote | Run `ssh-copy-id user@host` |
+| `python3: command not found` | Python path differs between nodes | Use full path e.g. `/usr/local/bin/python3` |
+| `KeyError: 'domain_uuid_key'` | Thunderbolt not properly connected (ring/TB mismatch) | Use `--backend ring --over ethernet` instead |
+| Rank hangs / never connects | Firewall blocking ports | Allow ports 5000–5100 on all nodes |
+| Slow generation despite multiple nodes | Wi-Fi bottleneck | Switch to wired gigabit Ethernet |
+| `mx.distributed.init()` returns size=1 | Hostfile not found or env vars missing | Verify hostfile path, use `mlx.launch` not direct `python3` |
+| Nodes get different model shard sizes | Unequal RAM across nodes | This is fine — MLX handles heterogeneous sharding |
+
+---
+
+### Distributed Architecture Summary
+
+```
+                    LAN (Ethernet/Wi-Fi)
+                           │
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+    ┌────┴────┐       ┌────┴────┐       ┌────┴────┐
+    │ Node 0  │◄─────►│ Node 1  │◄─────►│ Node 2  │
+    │ Rank 0  │       │ Rank 1  │       │ Rank 2  │
+    │ (ctrl)  │       │         │       │         │
+    │ Layers  │       │ Layers  │       │ Layers  │
+    │  0-N/3  │       │ N/3-2N/3│       │ 2N/3-N  │
+    └─────────┘       └─────────┘       └─────────┘
+         │
+    mlx.launch
+    SSHes to all,
+    coordinates,
+    forwards output
+    to terminal
+```
+
+All nodes participate equally in computation. Rank 0 is the coordinator — it's the one
+you run `mlx.launch` from, and it collects and prints output.
