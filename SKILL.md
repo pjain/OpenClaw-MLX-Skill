@@ -1,10 +1,10 @@
 ---
 name: mlx
 description: >
-  Run local Apple MLX-based models for image generation (Flux, SDXL), audio/TTS (mlx-audio),
-  and vision/multimodal models (mlx-vlm). Handles environment discovery, silent dependency
-  installation, model downloads, and execution. Use whenever the user asks to generate images,
-  audio, or describe/analyze images locally using MLX.
+  Run local Apple MLX-based models for image generation (mflux — Flux, Z-Image, FLUX.2, Qwen),
+  audio/TTS (mlx-audio), vision/multimodal analysis (mlx-vlm), and LLM text inference (mlx-lm).
+  Handles environment discovery, silent dependency installation, model downloads, and execution.
+  Use whenever the user asks to generate images, audio, text, or analyze images locally with MLX.
 save_path: /Users/clawd/clawd/skills/mlx/SKILL.md
 ---
 
@@ -52,7 +52,7 @@ try:
 except:
     info["free_disk_gb"] = "unknown"
 
-packages_to_check = ["mlx", "mflux", "mlx_audio", "mlx_vlm",
+packages_to_check = ["mlx", "mflux", "mlx_audio", "mlx_vlm", "mlx_lm",
                      "huggingface_hub", "numpy", "pillow", "soundfile"]
 installed = {}
 for pkg in packages_to_check:
@@ -62,6 +62,11 @@ for pkg in packages_to_check:
     except ImportError:
         installed[pkg] = None
 info["installed_packages"] = installed
+
+# mflux cache (moved to ~/Library/Caches/mflux/ in v0.6+)
+mflux_cache = os.path.expanduser("~/Library/Caches/mflux")
+info["mflux_cache"] = mflux_cache
+info["mflux_cache_exists"] = os.path.exists(mflux_cache)
 
 hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 info["hf_cache"] = hf_cache
@@ -79,6 +84,13 @@ try:
 except:
     info["hf_user"] = None
 
+# Check if uv is available (preferred mflux installer)
+try:
+    r = subprocess.check_output(["uv", "--version"], stderr=subprocess.DEVNULL).decode().strip()
+    info["uv_available"] = r
+except:
+    info["uv_available"] = None
+
 print(json.dumps(info, indent=2))
 ```
 
@@ -86,8 +98,9 @@ Parse this for:
 - `apple_silicon` + `macos_ok` → MLX is viable; if false, stop and inform the user
 - `ram_gb` → determines safe model sizes (see Step 2)
 - `installed_packages` → what the silent-installer needs to handle
-- `downloaded_models` → models already cached (skip re-download)
+- `downloaded_models` → models already in HF cache (skip re-download)
 - `hf_user` → whether HF auth is already set up
+- `uv_available` → whether uv is present (preferred install path for mflux)
 
 **If not Apple Silicon**: Inform the user MLX requires Apple Silicon Macs. Suggest cloud
 alternatives like Replicate or fal.ai for image/audio generation.
@@ -98,11 +111,13 @@ alternatives like Replicate or fal.ai for image/audio generation.
 
 | Category | User says... | Package | Notes |
 |----------|-------------|---------|-------|
-| **Image generation** | "generate an image", "make art of X", "create a picture" | `mflux` | Primary focus |
+| **Image generation** | "generate an image", "make art of X", "create a picture" | `mflux` | Multiple model families |
 | **Audio / TTS** | "say this", "speak", "generate audio", "text to speech" | `mlx-audio` | Kokoro default |
 | **Vision / VLM** | "describe this image", "what's in this photo", "analyze this" | `mlx-vlm` | Needs image input |
+| **LLM / Chat** | "run a local model", "chat with Llama", "use a local LLM" | `mlx-lm` | Distributed-capable |
 | **Music generation** | "generate music", "make a song" | `mlx-audio` (stable-audio) | Experimental |
 | **Image → Vision pipeline** | "generate then describe", "make and analyze" | `mflux` + `mlx-vlm` | Chain both |
+| **Image editing** | "edit this image", "change X in this photo" | `mflux` (Kontext/Qwen) | In-context editing |
 
 ---
 
@@ -110,12 +125,33 @@ alternatives like Replicate or fal.ai for image/audio generation.
 
 Use `ram_gb` from discovery to select appropriately. Never load a model that will OOM.
 
+### Image Generation RAM Guide
+
 ```
-8 GB   → Flux.1-schnell q4/q8 · Kokoro TTS · llava-1.5-7b-4bit
-16 GB  → Flux.1-dev q8 · Kokoro TTS · llava-1.5-13b or Qwen2-VL-7B-4bit
-32 GB  → Flux.1-dev q8 (comfortable) · Qwen2-VL-7B-4bit
-64 GB  → Flux.1-dev full precision · Qwen2-VL-72B-4bit
+8 GB   → Z-Image Turbo q8 (best choice) · flux-schnell q4 · FLUX.2 klein q8
+16 GB  → Z-Image Turbo q8 · flux-schnell q8 · flux-dev q8 · FLUX.2 klein q8
+32 GB  → flux-dev q8 (comfortable) · Qwen Image q6 · FLUX.2 dev q8
+64 GB  → flux-dev full · Qwen Image q8 · FLUX.2 dev q6
 96 GB+ → Any model at full precision
+```
+
+### LLM RAM Guide
+
+```
+8 GB   → Llama-3.2-3B-4bit · Phi-3.5-mini-4bit · Qwen2.5-3B-4bit
+16 GB  → Llama-3.1-8B-4bit · Mistral-7B-4bit · Qwen2.5-7B-4bit
+32 GB  → Llama-3.1-70B-4bit (tight) · Qwen2.5-32B-4bit
+64 GB  → Llama-3.1-70B-4bit (comfortable) · DeepSeek-R1-32B-4bit
+96 GB+ → DeepSeek-R1-70B-4bit · Llama-3.1-70B full precision
+```
+
+### Vision (VLM) RAM Guide
+
+```
+8 GB   → llava-1.5-7b-4bit
+16 GB  → Qwen2-VL-7B-Instruct-4bit (best)
+32 GB  → Qwen2-VL-7B (full) · InternVL2-8B
+64 GB+ → Qwen2-VL-72B-Instruct-4bit
 ```
 
 Always tell the user which model was selected and why (RAM-based).
@@ -124,8 +160,8 @@ Always tell the user which model was selected and why (RAM-based).
 
 ## Step 3 — Silent Auto-Install
 
-**Always install missing packages silently without asking the user.** Include this helper at
-the top of every generated script:
+**Always install missing packages silently without asking the user.** Include this helper
+at the top of every generated script:
 
 ```python
 import subprocess, sys
@@ -144,11 +180,26 @@ def ensure(*packages):
             )
 ```
 
+**mflux-specific**: The recommended install for mflux is via `uv tool` (if `uv` is available).
+If `uv_available` is not None from discovery, use:
+
+```python
+import subprocess
+# Install/upgrade mflux via uv tool (preferred)
+subprocess.run(
+    ["uv", "tool", "install", "--upgrade", "mflux", "--prerelease=allow"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+)
+# Otherwise fall back to pip:
+# ensure("mflux", "pillow")
+```
+
 Usage before imports:
 ```python
-ensure("mflux", "pillow")             # image generation
+ensure("mflux", "pillow")             # image generation (fallback)
 ensure("mlx-audio", "soundfile")      # audio / TTS
 ensure("mlx-vlm")                     # vision
+ensure("mlx-lm")                      # LLM inference
 ensure("huggingface_hub")             # always useful
 ```
 
@@ -174,55 +225,156 @@ Guide the user:
    Or:  export HUGGING_FACE_HUB_TOKEN="hf_your_token"
 ```
 
-**Requires HF login**: `black-forest-labs/FLUX.1-dev`
-**No login needed**: Flux.1-schnell via mflux, Kokoro TTS, most `mlx-community` VLMs
+**Models requiring HF login**: `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.2-dev`
+**No login needed**: Z-Image, FLUX.2 klein (Apache 2.0), flux-schnell via mflux, Kokoro TTS, most mlx-community VLMs/LLMs
 
 ---
 
 ## Step 5 — Execution
 
-### Image Generation (mflux)
+### Image Generation (mflux ≥ 0.6)
+
+> **API CHANGE from v0.4**: `Flux1.from_alias()` → `Flux1.from_name()`. `Config` object
+> is removed — `num_inference_steps`, `height`, `width` are now direct kwargs on
+> `generate_image()`. Always use the new API.
+
+#### Model Families (choose based on RAM + use case)
+
+| Model alias | CLI command | RAM (q8) | Steps | Best for |
+|-------------|------------|----------|-------|---------|
+| `schnell` | `mflux-generate --model schnell` | ~8 GB | 2–4 | Speed, drafts |
+| `dev` | `mflux-generate --model dev` | ~8 GB | 20–25 | Quality |
+| `krea-dev` | `mflux-generate --model krea-dev` | ~8 GB | 25 | Photorealism, avoids AI look |
+| `z-image-turbo` | `mflux-generate-z-image-turbo` | ~6 GB | 9 | **Best all-rounder 2025** |
+| `flux2-klein` | `mflux-generate --model flux2-klein` | ~5 GB | 4 | Fastest, real-time |
+| `qwen` | `mflux-generate-qwen` | ~14 GB | 20 | Best prompt understanding |
+
+**Recommendation**: Default to `z-image-turbo` unless user requests otherwise — it's the best
+speed/quality balance as of 2025. Fall back to `schnell` on 8 GB RAM systems.
+
+#### Python API (v0.6+ / latest)
 
 ```python
 ensure("mflux", "pillow")
 
 import os
-from mflux import Flux1, Config
+from mflux.models.flux.variants.txt2img.flux import Flux1
 
 out_dir = os.path.expanduser("~/Desktop/mlx-outputs")
 os.makedirs(out_dir, exist_ok=True)
 
-# Set these from Step 0 discovery
-ram_gb = 16  # replace with actual value
-model_name = "flux-schnell" if ram_gb < 16 else "flux-dev"
-steps     = 4 if model_name == "flux-schnell" else 20
-quantize  = 4 if ram_gb <= 8 else 8
+# RAM-based model selection (replace ram_gb with value from Step 0)
+ram_gb = 16
 
-flux = Flux1.from_alias(alias=model_name, quantize=quantize)
+if ram_gb >= 16:
+    model_name = "z-image-turbo"   # best all-rounder
+    steps = 9
+    quantize = 8
+elif ram_gb >= 8:
+    model_name = "schnell"
+    steps = 4
+    quantize = 8
+else:
+    model_name = "schnell"
+    steps = 4
+    quantize = 4
+
+flux = Flux1.from_name(
+    model_name=model_name,
+    quantize=quantize,
+)
+
 image = flux.generate_image(
     seed=42,
-    prompt="A photorealistic cat sitting on a misty mountain",
-    config=Config(num_inference_steps=steps, height=1024, width=1024),
+    prompt="A photorealistic cat sitting on a misty mountain at dawn",
+    num_inference_steps=steps,
+    height=1024,
+    width=1024,
 )
+
 output_path = os.path.join(out_dir, "output.png")
-image.save(path=output_path, export_json_metadata=False)
+image.save(path=output_path)
 print(f"Saved: {output_path}")
 
 import subprocess
-subprocess.Popen(["open", output_path])  # preview on macOS
+subprocess.Popen(["open", output_path])
 ```
 
-**Quantization guide**:
-- `quantize=4` → ~4 GB, fastest, slight quality loss
-- `quantize=8` → ~8 GB, balanced (recommended default)
+#### Z-Image Turbo (recommended default, 2025)
+
+```python
+from mflux.models.z_image import ZImageTurbo
+
+model = ZImageTurbo(quantize=8)
+image = model.generate_image(
+    prompt="A puffin standing on a cliff overlooking the ocean",
+    seed=42,
+    num_inference_steps=9,
+    width=1280,
+    height=500,
+)
+image.save(path="output.png")
+```
+
+CLI:
+```bash
+mflux-generate-z-image-turbo \
+  --prompt "A puffin standing on a cliff" \
+  --width 1280 --height 500 \
+  --seed 42 --steps 9 -q 8
+```
+
+#### FLUX.2 Klein (fastest, Apache 2.0)
+
+```bash
+mflux-generate --model flux2-klein \
+  --prompt "A serene Japanese garden at dawn" \
+  --steps 4 --seed 42 -q 8
+```
+
+#### Flux-dev / Krea-dev (highest FLUX.1 quality)
+
+```bash
+# Standard dev
+mflux-generate --model dev --prompt "your prompt" --steps 25 --seed 42 -q 8
+
+# Krea-dev (photorealistic, avoids AI look)
+mflux-generate --model krea-dev --prompt "A photo of a dog" --steps 25 --seed 2674888 -q 8
+```
+
+#### Image Editing (Kontext)
+
+```bash
+mflux-generate-kontext \
+  --image-path original.jpg \
+  --prompt "Change the sky to a stormy sunset" \
+  --steps 25 --seed 42
+```
+
+#### Qwen Image (best prompt understanding, needs 14+ GB)
+
+```bash
+mflux-generate-qwen --prompt "Luxury food photograph" --steps 20 --seed 2 -q 6
+```
+
+#### Image-to-Image
+
+```bash
+mflux-generate --model dev \
+  --prompt "Turn this into an oil painting" \
+  --image-path input.jpg \
+  --image-strength 0.6 \
+  --steps 20 --seed 42 -q 8
+```
+
+**Quantization reference** (valid values: 3, 4, 5, 6, 8):
+- `-q 4` → lowest RAM, fastest, slight quality loss
+- `-q 6` → balanced for large models
+- `-q 8` → best quality/RAM tradeoff (recommended default)
 - no quantize → full precision, most RAM, best quality
 
-**CLI shortcut**:
-```bash
-mflux-generate --model flux-schnell --prompt "your prompt" \
-  --steps 4 --width 1024 --height 1024 --quantize 8 \
-  --output ~/Desktop/mlx-outputs/output.png
-```
+**mflux cache location** (v0.6+): `~/Library/Caches/mflux/`
+Set `MFLUX_CACHE_DIR` to override. HF model weights: `~/.cache/huggingface/`
 
 ---
 
@@ -249,17 +401,84 @@ sf.write(output_path, audio, sample_rate)
 print(f"Saved: {output_path}")
 
 import subprocess
-subprocess.Popen(["afplay", output_path])  # play on macOS
+subprocess.Popen(["afplay", output_path])
 ```
 
 **TTS Models** (lightest → best quality):
 | Model | RAM | Notes |
 |-------|-----|-------|
-| `prince-canuma/Kokoro-82M` | ~1 GB | Default — fast, good quality |
+| `prince-canuma/Kokoro-82M` | ~1 GB | Default — fast, great quality |
 | `hexgrad/Kokoro-82M` | ~1 GB | Alternative Kokoro variant |
 | `suno/bark-small` | ~2 GB | More expressive, slower |
 
 **Kokoro voices**: `af` · `af_heart` · `af_bella` · `af_sarah` · `am_adam` · `bf_emma` · `bm_george`
+
+---
+
+### LLM / Text Inference (mlx-lm)
+
+```python
+ensure("mlx-lm")
+
+from mlx_lm import load, generate
+
+# RAM-based model selection (replace ram_gb from Step 0)
+ram_gb = 16
+if ram_gb >= 64:
+    model_id = "mlx-community/Llama-3.1-70B-Instruct-4bit"
+elif ram_gb >= 32:
+    model_id = "mlx-community/Qwen2.5-32B-Instruct-4bit"
+elif ram_gb >= 16:
+    model_id = "mlx-community/Llama-3.1-8B-Instruct-4bit"
+elif ram_gb >= 8:
+    model_id = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+else:
+    model_id = "mlx-community/Phi-3.5-mini-instruct-4bit"
+
+model, tokenizer = load(model_id)
+
+# For chat-style prompts, apply the chat template
+from mlx_lm.utils import make_kv_cache
+messages = [{"role": "user", "content": "Explain quantum entanglement simply."}]
+if hasattr(tokenizer, "apply_chat_template"):
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+else:
+    prompt = messages[0]["content"]
+
+response = generate(
+    model, tokenizer,
+    prompt=prompt,
+    max_tokens=512,
+    verbose=True,
+)
+print(response)
+```
+
+**CLI shortcuts**:
+```bash
+# One-shot generation
+mlx_lm.generate \
+  --model mlx-community/Llama-3.1-8B-Instruct-4bit \
+  --prompt "Explain quantum entanglement simply" \
+  --max-tokens 512
+
+# Interactive chat REPL
+mlx_lm.chat --model mlx-community/Llama-3.1-8B-Instruct-4bit
+
+# REST server (OpenAI-compatible endpoint on port 8080)
+mlx_lm.server --model mlx-community/Llama-3.1-8B-Instruct-4bit --port 8080
+```
+
+**Recommended models by RAM**:
+| RAM | Model | Notes |
+|-----|-------|-------|
+| 4–8 GB | `mlx-community/Llama-3.2-3B-Instruct-4bit` | Lightweight, fast |
+| 8–16 GB | `mlx-community/Llama-3.1-8B-Instruct-4bit` | Best 8B overall |
+| 16 GB | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | Great all-rounder |
+| 32 GB | `mlx-community/Qwen2.5-32B-Instruct-4bit` | Strong reasoning |
+| 64+ GB | `mlx-community/Llama-3.1-70B-Instruct-4bit` | Near frontier quality |
 
 ---
 
@@ -273,7 +492,7 @@ from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
 
-# RAM-based model selection — replace ram_gb with value from Step 0
+# RAM-based model selection
 ram_gb = 16
 if ram_gb >= 64:
     model_id = "mlx-community/Qwen2-VL-72B-Instruct-4bit"
@@ -285,7 +504,7 @@ else:
 model, processor = load(model_id)
 config = load_config(model_id)
 
-image_path = "path/to/image.jpg"  # local path or URL
+image_path = "path/to/image.jpg"
 prompt = "Describe this image in detail."
 
 formatted = apply_chat_template(processor, config, prompt, num_images=1)
@@ -297,7 +516,6 @@ print(response)
 | Model | RAM | Strength |
 |-------|-----|---------|
 | `mlx-community/llava-1.5-7b-4bit` | 8 GB | General vision Q&A |
-| `mlx-community/llava-1.5-13b-4bit` | 16 GB | Better reasoning |
 | `mlx-community/Qwen2-VL-7B-Instruct-4bit` | 16 GB | Excellent OCR + detail |
 | `mlx-community/Qwen2-VL-72B-Instruct-4bit` | 64 GB | Near-GPT4V quality |
 
@@ -309,7 +527,7 @@ print(response)
 ensure("mflux", "mlx-vlm", "pillow")
 
 import os
-from mflux import Flux1, Config
+from mflux.models.flux.variants.txt2img.flux import Flux1
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
@@ -318,19 +536,22 @@ out_dir = os.path.expanduser("~/Desktop/mlx-outputs")
 os.makedirs(out_dir, exist_ok=True)
 img_path = os.path.join(out_dir, "generated.png")
 
-# 1. Generate
-flux = Flux1.from_alias(alias="flux-schnell", quantize=8)
+# 1. Generate with Z-Image Turbo (best all-rounder)
+from mflux.models.z_image import ZImageTurbo
+flux = ZImageTurbo(quantize=8)
 image = flux.generate_image(
-    seed=42,
     prompt="A serene Japanese garden at dawn",
-    config=Config(num_inference_steps=4, height=1024, width=1024),
+    seed=42,
+    num_inference_steps=9,
+    width=1024,
+    height=1024,
 )
-image.save(path=img_path, export_json_metadata=False)
+image.save(path=img_path)
 print(f"Image saved: {img_path}")
 
-# 2. Analyze
-model, processor = load("mlx-community/llava-1.5-7b-4bit")
-cfg = load_config("mlx-community/llava-1.5-7b-4bit")
+# 2. Analyze with VLM
+model, processor = load("mlx-community/Qwen2-VL-7B-Instruct-4bit")
+cfg = load_config("mlx-community/Qwen2-VL-7B-Instruct-4bit")
 formatted = apply_chat_template(processor, cfg, "Describe this image in detail.", num_images=1)
 description = generate(model, processor, img_path, formatted, verbose=False)
 print(f"\nDescription:\n{description}")
@@ -358,12 +579,16 @@ After every generation:
 |----------------|-------|-----|
 | `machine != arm64` | Intel Mac / non-Mac | Inform user, MLX not supported |
 | `RuntimeError: Out of memory` | Model too large for RAM | Higher quantization or smaller model |
+| `SIGKILL` / process killed | macOS OOM killer | Use `--low-ram` flag or smaller model |
 | `403 Forbidden` / `Repository not found` | HF auth required | `huggingface-cli login` |
-| `ModuleNotFoundError` | Package missing | `ensure(...)` auto-handles on next run |
-| Process killed (SIGKILL) | macOS OOM killer | Switch to quantize=4 or smaller model |
-| Very slow (>5 min) | No quantization | Add quantize=8 |
-| Black / corrupted image | Stale mflux version | `pip install -U mflux` |
+| `ModuleNotFoundError` | Package missing | `ensure(...)` auto-handles |
+| Very slow generation (>10 min) | No quantization | Add `-q 8` |
+| Black or corrupted image | Stale mflux or MLX mismatch | `pip install -U mflux mlx` |
 | VLM garbled output | Wrong prompt template | Use `apply_chat_template` from mlx_vlm |
+| `Flux1.from_alias()` AttributeError | Old mflux API (< 0.6) | Upgrade: `pip install -U mflux` |
+| `Config` import error | Old mflux API (< 0.6) | Same — use `from_name()` + direct kwargs |
+| LLM hangs on first token | Model loading (normal) | Wait 30–60 sec on first load |
+| `mlx_lm.server` not found | Old mlx-lm version | `pip install -U mlx-lm` |
 
 ---
 
@@ -374,48 +599,68 @@ When a new MLX project appears, add it here:
 1. **Find the PyPI package** — check the project's GitHub README
 2. **Add `ensure("new-package")`** to Step 5 in the relevant section
 3. **Add to the category table** in Step 1 if it's a new capability
-4. **Add RAM requirements** to Step 2 if known
+4. **Add RAM requirements** to Step 2 RAM guides
 5. **Add to the tracked projects table** below
-6. **Add error patterns** to the Error Handling table
+6. **Add any new error patterns** to the Error Handling table
 
 ### Tracked MLX Projects
 
-| Project | PyPI | HF Namespace | Status | Priority |
-|---------|------|--------------|--------|----------|
-| Flux image generation | `mflux` | `black-forest-labs` | ✅ Stable | ⭐ Primary |
-| Audio / TTS | `mlx-audio` | `prince-canuma` | ✅ Stable | ⭐ Primary |
-| Vision / VLM | `mlx-vlm` | `mlx-community` | ✅ Stable | ⭐ Primary |
+| Project | PyPI | HF Namespace | Status | Notes |
+|---------|------|--------------|--------|-------|
+| mflux (Flux, Z-Image, FLUX.2) | `mflux` | `black-forest-labs`, `Tongyi-MAI` | ✅ v0.16+ | Primary image gen |
+| Audio / TTS | `mlx-audio` | `prince-canuma` | ✅ Stable | TTS, music |
+| Vision / VLM | `mlx-vlm` | `mlx-community` | ✅ Stable | Image analysis |
+| LLM inference | `mlx-lm` | `mlx-community` | ✅ Stable | Chat, server, distributed |
 | MLX core | `mlx` | — | ✅ Stable | Dependency |
-| Whisper STT | `mlx-whisper` | `mlx-community` | ✅ Stable | Extend when needed |
+| Whisper STT | `mlx-whisper` | `mlx-community` | ✅ Stable | Speech-to-text |
 | Stable Audio | via `mlx-audio` | `stabilityai` | 🧪 Experimental | Music generation |
-| SDXL | `mlx-stable-diffusion` | `apple` | 🧪 Experimental | Alt image gen |
 
 ---
 
 ## Quick Reference
 
 ```bash
-# Image — Flux CLI
-mflux-generate --model flux-schnell --prompt "your prompt" \
-  --steps 4 --quantize 8 --output ~/Desktop/mlx-outputs/out.png
+# Image — Z-Image Turbo (best all-rounder, recommended default)
+mflux-generate-z-image-turbo --prompt "your prompt" \
+  --steps 9 --seed 42 -q 8 --width 1024 --height 1024
 
-# Audio — TTS one-liner
+# Image — Flux-schnell (fast, good quality)
+mflux-generate --model schnell --prompt "your prompt" --steps 4 -q 8
+
+# Image — Flux-dev (highest Flux.1 quality)
+mflux-generate --model dev --prompt "your prompt" --steps 25 -q 8
+
+# Image — FLUX.2 Klein (fastest, Apache 2.0)
+mflux-generate --model flux2-klein --prompt "your prompt" --steps 4 -q 8
+
+# Image — Image editing with Kontext
+mflux-generate-kontext --image-path photo.jpg --prompt "change the background to a beach" --steps 25
+
+# Audio — TTS
 python3 -c "
-from mlx_audio.tts.generate import generate_audio
-import soundfile as sf
+from mlx_audio.tts.generate import generate_audio; import soundfile as sf
 audio, sr = generate_audio('Hello world', model='prince-canuma/Kokoro-82M', voice='af_heart')
 sf.write('out.wav', audio, sr)
 import subprocess; subprocess.Popen(['afplay', 'out.wav'])
 "
+
+# LLM — one-shot
+mlx_lm.generate --model mlx-community/Llama-3.1-8B-Instruct-4bit --prompt "Hello"
+
+# LLM — interactive chat
+mlx_lm.chat --model mlx-community/Llama-3.1-8B-Instruct-4bit
+
+# LLM — OpenAI-compatible server
+mlx_lm.server --model mlx-community/Llama-3.1-8B-Instruct-4bit --port 8080
 
 # Vision — describe an image
 python3 -c "
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
-m, p = load('mlx-community/llava-1.5-7b-4bit')
-c = load_config('mlx-community/llava-1.5-7b-4bit')
-f = apply_chat_template(p, c, 'What is in this image?', num_images=1)
+m, p = load('mlx-community/Qwen2-VL-7B-Instruct-4bit')
+c = load_config('mlx-community/Qwen2-VL-7B-Instruct-4bit')
+f = apply_chat_template(p, c, 'Describe this image.', num_images=1)
 print(generate(m, p, 'image.jpg', f, verbose=False))
 "
 ```
@@ -431,263 +676,104 @@ User request
     ├─ macOS < 13.5       →  Stop. Ask user to update macOS
     │
     ├─ Image generation
-    │       RAM < 8 GB    →  flux-schnell, quantize=4
-    │       RAM 8-15 GB   →  flux-schnell, quantize=8
-    │       RAM 16+ GB    →  flux-dev,     quantize=8
+    │       RAM < 8 GB    →  z-image-turbo q4  OR  flux-schnell q4
+    │       RAM 8-15 GB   →  z-image-turbo q8  (best all-rounder)
+    │       RAM 16-31 GB  →  z-image-turbo q8  OR  flux-dev q8
+    │       RAM 32+ GB    →  flux-dev q8  OR  Qwen Image q6
+    │       Fastest?      →  FLUX.2 klein q8 (any RAM 8GB+)
+    │       Photorealism? →  krea-dev q8
+    │       Editing?      →  Kontext OR Qwen Image Edit
     │
     ├─ Audio / TTS
     │       Any RAM       →  Kokoro-82M (works everywhere)
-    │       Want expressive → bark-small if RAM > 4 GB
+    │       Expressive?   →  bark-small if RAM > 4 GB
+    │
+    ├─ LLM / text inference
+    │       RAM 4-8 GB    →  Llama-3.2-3B-4bit
+    │       RAM 8-16 GB   →  Llama-3.1-8B-4bit
+    │       RAM 16-32 GB  →  Mistral-7B or Qwen2.5-14B-4bit
+    │       RAM 32-64 GB  →  Qwen2.5-32B-4bit
+    │       RAM 64+ GB    →  Llama-3.1-70B-4bit
+    │       Distributed?  →  mlx.launch with ring backend (see Distributed section)
     │
     ├─ Vision / VLM
     │       RAM 8-15 GB   →  llava-1.5-7b-4bit
     │       RAM 16-31 GB  →  Qwen2-VL-7B-Instruct-4bit
     │       RAM 64+ GB    →  Qwen2-VL-72B-Instruct-4bit
     │
-    ├─ Image + Vision pipeline  →  mflux → mlx-vlm (see Step 5)
+    ├─ Image + Vision pipeline  →  z-image-turbo → Qwen2-VL (see Step 5)
     │
     └─ New/unknown MLX model    →  Check mlx-community on HF, follow Extensibility guide
 ```
 
 ---
 
-## Distributed Inference — LAN Cluster
+## Distributed Inference — LAN Cluster (LLM)
 
-MLX supports distributed inference across multiple Macs on a LAN using `mlx.launch`.
-Model layers are sharded (tensor parallelism) across all nodes, letting you pool RAM across
-machines to run models far larger than any single Mac could handle.
+MLX supports distributed LLM inference across multiple Macs on a LAN using `mlx.launch`.
+This pools RAM across machines to run models larger than any single Mac could hold.
 
-> **Combined RAM example**: 4× Mac Mini M4 with 24 GB each = 96 GB effective RAM,
-> enough to run a 70B model at 4-bit quantization comfortably.
-
-### How It Works
-
-MLX distributes using **tensor parallelism** — each node holds a shard of the model's
-weight matrices. On every forward pass, all nodes communicate intermediate results via
-collective operations (`all_reduce`, `all_sum`). The ring backend does this over TCP/IP,
-making it work on any LAN including Wi-Fi (though gigabit Ethernet or better is strongly
-preferred for throughput).
+> **Note:** Distributed inference currently applies to LLMs (mlx-lm). Image generation
+> (mflux) and vision models (mlx-vlm) do not yet support multi-node sharding — use the
+> single node with the most RAM for those.
 
 ### Backend Selection
 
-| Backend | Transport | Requirements | Latency | Best For |
-|---------|-----------|-------------|---------|----------|
-| `ring` | Ethernet/Wi-Fi TCP | SSH + same Python path | Medium | **LAN clusters — use this** |
-| `jaccl` | Thunderbolt 5 RDMA | macOS 26.2+, TB5 cables, recovery mode setup | Ultra-low | Directly connected Macs |
-| `mpi` | TCP via OpenMPI | OpenMPI installed | Medium | Legacy setups |
+| Backend | Transport | Requirements | Best For |
+|---------|-----------|-------------|----------|
+| `ring` | Ethernet/Wi-Fi TCP | SSH + same Python path | **LAN clusters — use this** |
+| `jaccl` | Thunderbolt 5 RDMA | macOS 26.2+, TB5 cables | Directly-connected Macs |
+| `mpi` | TCP via OpenMPI | OpenMPI installed | Legacy setups |
 
-For a general LAN (the common case), **always use the ring backend**.
-
----
-
-### Prerequisites Checklist
-
-Run this on the **controller node** to verify readiness before attempting distributed launch:
-
-```python
-import subprocess, json, os, sys
-
-def check_node(host, python_path=None):
-    """SSH to a node and verify it's ready for MLX distributed inference."""
-    results = {}
-
-    # SSH reachable?
-    r = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
-                        host, "echo ok"], capture_output=True, text=True)
-    results["ssh_ok"] = r.returncode == 0
-
-    if not results["ssh_ok"]:
-        results["error"] = r.stderr.strip()
-        return results
-
-    # Apple Silicon?
-    r = subprocess.run(["ssh", host, "uname -m"], capture_output=True, text=True)
-    results["apple_silicon"] = r.stdout.strip() == "arm64"
-
-    # Python path
-    py = python_path or "python3"
-    r = subprocess.run(["ssh", host, f"{py} -c 'import mlx; print(mlx.__version__)'"],
-                       capture_output=True, text=True)
-    results["mlx_installed"] = r.returncode == 0
-    results["mlx_version"] = r.stdout.strip() if r.returncode == 0 else None
-
-    # mlx-lm installed?
-    r = subprocess.run(["ssh", host, f"{py} -c 'import mlx_lm; print(mlx_lm.__version__)'"],
-                       capture_output=True, text=True)
-    results["mlx_lm_installed"] = r.returncode == 0
-
-    # RAM
-    r = subprocess.run(["ssh", host, "sysctl -n hw.memsize"], capture_output=True, text=True)
-    if r.returncode == 0:
-        results["ram_gb"] = round(int(r.stdout.strip()) / 1e9, 1)
-
-    # IP on LAN
-    r = subprocess.run(["ssh", host, "ipconfig getifaddr en0"], capture_output=True, text=True)
-    results["lan_ip"] = r.stdout.strip() or None
-
-    return results
-
-# --- Configure these ---
-HOSTS = ["mac-mini-1.local", "mac-mini-2.local", "mac-mini-3.local"]
-PYTHON_PATH = "/usr/local/bin/python3"   # must be identical on all nodes
-# ----------------------
-
-print("Checking cluster readiness...\n")
-total_ram = 0
-all_ready = True
-for host in HOSTS:
-    r = check_node(host, PYTHON_PATH)
-    ok = r.get("ssh_ok") and r.get("mlx_installed") and r.get("mlx_lm_installed")
-    ram = r.get("ram_gb", 0)
-    total_ram += ram
-    status = "✅" if ok else "❌"
-    print(f"{status} {host}: SSH={r.get('ssh_ok')} MLX={r.get('mlx_installed')} "
-          f"mlx-lm={r.get('mlx_lm_installed')} RAM={ram}GB IP={r.get('lan_ip')}")
-    if not ok:
-        all_ready = False
-        if r.get("error"):
-            print(f"   Error: {r['error']}")
-
-print(f"\nTotal pooled RAM: {total_ram} GB")
-print(f"Cluster ready: {'YES' % all_ready if all_ready else 'NO — fix issues above first'}")
-```
-
-Fix any failures before proceeding:
-- **SSH not ok**: Enable Remote Login on that Mac (`System Settings → General → Sharing → Remote Login`), then set up passwordless SSH keys
-- **MLX not installed**: SSH in and `pip install mlx mlx-lm`
-- **Python path mismatch**: All nodes must use the exact same Python binary path
-
----
-
-### Step D1 — Set Up Passwordless SSH
-
-Each node needs to be able to SSH to every other node without a password prompt.
-Run this once from the controller, replacing hostnames:
+### Prerequisites
 
 ```bash
-# Generate SSH key if you don't have one
-ssh-keygen -t ed25519 -C "mlx-cluster" -f ~/.ssh/id_mlx -N ""
+# Enable Remote Login on each node (System Settings → Sharing → Remote Login)
+# Or via Terminal on each node:
+sudo systemsetup -setremotelogin on
 
-# Copy key to each node
-for HOST in mac-mini-1.local mac-mini-2.local mac-mini-3.local; do
+# Set up passwordless SSH from controller to each node
+ssh-keygen -t ed25519 -C "mlx-cluster" -f ~/.ssh/id_mlx -N ""
+for HOST in mac-mini-2.local mac-mini-3.local; do
     ssh-copy-id -i ~/.ssh/id_mlx.pub "$HOST"
 done
 
-# Verify (should not prompt for password)
-for HOST in mac-mini-1.local mac-mini-2.local mac-mini-3.local; do
-    ssh -i ~/.ssh/id_mlx "$HOST" "echo '$HOST: SSH OK'"
-done
+# Verify (no password prompt)
+ssh mac-mini-2.local "echo 'OK'"
 ```
 
----
-
-### Step D2 — Discover LAN Nodes Automatically
-
-Don't hardcode IPs — scan the LAN for Macs with MLX installed:
+### Cluster Health Check
 
 ```python
-import subprocess, ipaddress, concurrent.futures, socket
+import subprocess, json
 
-def get_local_subnet():
-    """Get the local /24 subnet to scan."""
-    result = subprocess.run(["ipconfig", "getifaddr", "en0"], capture_output=True, text=True)
-    ip = result.stdout.strip()
-    if not ip:
-        result = subprocess.run(["ipconfig", "getifaddr", "en1"], capture_output=True, text=True)
-        ip = result.stdout.strip()
-    if not ip:
-        raise RuntimeError("Could not determine local IP address")
-    # Return the /24 network
-    parts = ip.rsplit(".", 1)
-    return f"{parts[0]}.0/24", ip
+HOSTS = ["mac-mini-2.local", "mac-mini-3.local"]
+PYTHON = "/usr/local/bin/python3"  # must be identical on ALL nodes
 
-def probe_host(ip, python_path="python3", timeout=2):
-    """Check if a host has MLX installed and return its info."""
-    try:
-        # Try SSH
-        r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes",
-             "-o", "StrictHostKeyChecking=no", str(ip),
-             f"{python_path} -c \"import mlx, mlx_lm, platform, json; "
-             f"mem=int(__import__('subprocess').check_output(['sysctl','-n','hw.memsize']).decode()); "
-             f"print(json.dumps({{'ip': str('{ip}'), 'ram_gb': round(mem/1e9,1), "
-             f"'mlx': mlx.__version__, 'hostname': platform.node()}}))\""],
-            capture_output=True, text=True, timeout=timeout + 1
-        )
-        if r.returncode == 0:
-            import json
-            return json.loads(r.stdout.strip())
-    except:
-        pass
-    return None
+total_ram, all_ok = 0, True
+for host in HOSTS:
+    r = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host,
+         f"{PYTHON} -c \"import mlx, mlx_lm, platform, subprocess, json; "
+         f"mem=int(subprocess.check_output(['sysctl','-n','hw.memsize']).decode()); "
+         f"print(json.dumps({{'host':'{host}','mlx':mlx.__version__,"
+         f"'mlx_lm':mlx_lm.__version__,'ram_gb':round(mem/1e9,1)}}))\""],
+        capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        info = json.loads(r.stdout.strip())
+        total_ram += info["ram_gb"]
+        print(f"✅ {host}: MLX {info['mlx']} · mlx-lm {info['mlx_lm']} · {info['ram_gb']} GB")
+    else:
+        all_ok = False
+        print(f"❌ {host}: {r.stderr.strip()}")
 
-def discover_mlx_nodes(python_path="python3", max_workers=50):
-    """Scan the local subnet for Macs with MLX installed."""
-    subnet, local_ip = get_local_subnet()
-    print(f"Scanning {subnet} for MLX nodes (local IP: {local_ip})...")
-    network = ipaddress.IPv4Network(subnet, strict=False)
-    hosts = [str(ip) for ip in network.hosts()]
-
-    found = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(probe_host, ip, python_path): ip for ip in hosts}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                found.append(result)
-                print(f"  Found: {result['hostname']} ({result['ip']}) — "
-                      f"{result['ram_gb']} GB RAM, MLX {result['mlx']}")
-
-    found.sort(key=lambda x: x["ram_gb"], reverse=True)
-    total_ram = sum(n["ram_gb"] for n in found)
-    print(f"\nFound {len(found)} MLX nodes, {total_ram} GB pooled RAM")
-    return found
-
-# Run discovery
-PYTHON_PATH = "/usr/local/bin/python3"  # adjust to match your nodes
-nodes = discover_mlx_nodes(python_path=PYTHON_PATH)
+print(f"\nPooled RAM: {total_ram} GB — {'READY' if all_ok else 'NOT READY'}")
 ```
 
----
+### Generate Hostfile
 
-### Step D3 — Generate Hostfile
-
-`mlx.launch` needs a JSON hostfile describing each node. Generate it from discovered nodes:
-
-```python
-import json, subprocess
-
-def generate_hostfile(nodes, python_path, output_path="~/.mlx-cluster.json"):
-    """Generate an mlx.launch-compatible hostfile from discovered nodes."""
-    import os
-    output_path = os.path.expanduser(output_path)
-
-    hostfile = []
-    for i, node in enumerate(nodes):
-        hostfile.append({
-            "ssh": node["ip"],
-            "ips": [node["ip"]],
-            "python": python_path,
-        })
-
-    with open(output_path, "w") as f:
-        json.dump(hostfile, f, indent=2)
-
-    print(f"Hostfile written to: {output_path}")
-    print(f"Contents:\n{json.dumps(hostfile, indent=2)}")
-    return output_path
-
-# OR: use MLX's built-in tool for Ethernet setup
-# mlx.distributed_config --backend ring --over ethernet --hosts host1,host2,host3
-
-# Generate from discovered nodes
-PYTHON_PATH = "/usr/local/bin/python3"
-hostfile_path = generate_hostfile(nodes, python_path=PYTHON_PATH)
-```
-
-**Or use the built-in MLX config tool** (simpler if all nodes use hostnames):
 ```bash
-# Auto-generate hostfile for ring over Ethernet
 mlx.distributed_config \
   --backend ring \
   --over ethernet \
@@ -695,137 +781,45 @@ mlx.distributed_config \
   --output ~/.mlx-cluster.json
 ```
 
----
-
-### Step D4 — Launch Distributed Inference
-
-#### LLM Inference (mlx-lm, the primary distributed use case)
+### Launch Distributed LLM
 
 ```bash
-# Basic distributed chat
+# Distributed chat
 mlx.launch \
-  --verbose \
-  --backend ring \
-  --hostfile ~/.mlx-cluster.json \
-  -- \
-  /usr/local/bin/python3 -m mlx_lm.generate \
-    --model mlx-community/Llama-3.1-70B-Instruct-4bit \
-    --prompt "Explain the theory of relativity" \
-    --max-tokens 500
-
-# Interactive distributed chat REPL
-mlx.launch \
-  --backend ring \
-  --hostfile ~/.mlx-cluster.json \
-  -- \
-  /usr/local/bin/python3 -m mlx_lm chat \
-    --model mlx-community/DeepSeek-R1-0528-4bit
-```
-
-**With the performance env var** (recommended for LAN):
-```bash
-mlx.launch \
-  --verbose \
   --backend ring \
   --hostfile ~/.mlx-cluster.json \
   --env MLX_METAL_FAST_SYNCH=1 \
   -- \
-  /usr/local/bin/python3 -m mlx_lm chat \
+  /usr/local/bin/python3 -m mlx_lm.chat \
     --model mlx-community/Llama-3.1-70B-Instruct-4bit
+
+# Distributed server (OpenAI API on port 8080)
+mlx.launch \
+  --backend ring \
+  --hostfile ~/.mlx-cluster.json \
+  -- \
+  /usr/local/bin/python3 -m mlx_lm.server \
+    --model mlx-community/Llama-3.1-70B-Instruct-4bit \
+    --port 8080
 ```
 
-#### Python API for distributed inference
-
-```python
-# This script must be launched via mlx.launch, not run directly
-import mlx.core as mx
-from mlx_lm import load, generate
-
-# Initialize distributed group — automatically picks up rank/hostfile from env
-world = mx.distributed.init()
-rank = world.rank()
-size = world.size()
-
-if rank == 0:
-    print(f"Running distributed inference across {size} nodes")
-
-# Load model — mlx-lm handles sharding automatically when distributed
-model, tokenizer = load("mlx-community/Llama-3.1-70B-Instruct-4bit")
-
-# Only rank 0 needs to handle output
-if rank == 0:
-    response = generate(model, tokenizer, prompt="Hello!", max_tokens=200, verbose=True)
-    print(response)
-else:
-    generate(model, tokenizer, prompt="Hello!", max_tokens=200, verbose=False)
-```
-
-Save as `distributed_infer.py` (same path on all nodes), then launch:
-```bash
-mlx.launch --backend ring --hostfile ~/.mlx-cluster.json \
-  -- /usr/local/bin/python3 /path/to/distributed_infer.py
-```
-
----
-
-### Step D5 — Model Size vs Node Count Guide
-
-Use pooled RAM to determine which models become accessible:
+### Cluster RAM × Model Guide
 
 ```
-2 nodes × 16 GB =  32 GB → Llama-3.1-8B (full), Qwen2.5-14B-4bit
-2 nodes × 24 GB =  48 GB → Llama-3.1-70B-4bit (tight), Mixtral-8x7B
-2 nodes × 32 GB =  64 GB → Llama-3.1-70B-4bit (comfortable)
-4 nodes × 16 GB =  64 GB → Llama-3.1-70B-4bit, DeepSeek-V3-4bit
-4 nodes × 24 GB =  96 GB → DeepSeek-R1-4bit, Llama-3.1-70B full precision
-4 nodes × 32 GB = 128 GB → Any current open-source model at full precision
-8 nodes × 16 GB = 128 GB → Same as above
+2× 16 GB =  32 GB → Llama-3.1-8B full · Qwen2.5-14B-4bit
+2× 24 GB =  48 GB → Llama-3.1-70B-4bit (tight)
+4× 16 GB =  64 GB → Llama-3.1-70B-4bit (comfortable)
+4× 24 GB =  96 GB → DeepSeek-R1-4bit · Llama-3.1-70B full precision
+4× 32 GB = 128 GB → Any current model at full precision
 ```
-
-**Recommended distributed models** (tensor-parallel friendly):
-- `mlx-community/Llama-3.1-70B-Instruct-4bit` — 40 GB, needs 2× 24 GB or 3× 16 GB
-- `mlx-community/DeepSeek-R1-0528-4bit` — excellent reasoning, very large
-- `mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit` — MoE, distributes efficiently
-- `mlx-community/Qwen2.5-72B-Instruct-4bit` — great multilingual performance
-
----
 
 ### Distributed Error Handling
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `ssh: connect to host X port 22: Connection refused` | Remote Login not enabled | System Settings → Sharing → Remote Login → On |
-| `Permission denied (publickey)` | SSH key not on remote | Run `ssh-copy-id user@host` |
-| `python3: command not found` | Python path differs between nodes | Use full path e.g. `/usr/local/bin/python3` |
-| `KeyError: 'domain_uuid_key'` | Thunderbolt not properly connected (ring/TB mismatch) | Use `--backend ring --over ethernet` instead |
-| Rank hangs / never connects | Firewall blocking ports | Allow ports 5000–5100 on all nodes |
-| Slow generation despite multiple nodes | Wi-Fi bottleneck | Switch to wired gigabit Ethernet |
-| `mx.distributed.init()` returns size=1 | Hostfile not found or env vars missing | Verify hostfile path, use `mlx.launch` not direct `python3` |
-| Nodes get different model shard sizes | Unequal RAM across nodes | This is fine — MLX handles heterogeneous sharding |
-
----
-
-### Distributed Architecture Summary
-
-```
-                    LAN (Ethernet/Wi-Fi)
-                           │
-         ┌─────────────────┼─────────────────┐
-         │                 │                 │
-    ┌────┴────┐       ┌────┴────┐       ┌────┴────┐
-    │ Node 0  │◄─────►│ Node 1  │◄─────►│ Node 2  │
-    │ Rank 0  │       │ Rank 1  │       │ Rank 2  │
-    │ (ctrl)  │       │         │       │         │
-    │ Layers  │       │ Layers  │       │ Layers  │
-    │  0-N/3  │       │ N/3-2N/3│       │ 2N/3-N  │
-    └─────────┘       └─────────┘       └─────────┘
-         │
-    mlx.launch
-    SSHes to all,
-    coordinates,
-    forwards output
-    to terminal
-```
-
-All nodes participate equally in computation. Rank 0 is the coordinator — it's the one
-you run `mlx.launch` from, and it collects and prints output.
+| `Connection refused` port 22 | Remote Login off | `sudo systemsetup -setremotelogin on` |
+| `Permission denied (publickey)` | SSH key not deployed | `ssh-copy-id user@node` |
+| `python3: command not found` | Path mismatch | Use full absolute path in hostfile |
+| Rank hangs / never connects | Firewall blocking ports | Allow Python through macOS firewall |
+| `init()` returns `size=1` | Used `python3` not `mlx.launch` | Use `mlx.launch` |
+| Slow despite cluster | Wi-Fi bottleneck | Switch to wired gigabit Ethernet |
